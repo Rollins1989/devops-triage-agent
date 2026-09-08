@@ -150,24 +150,4 @@ tests/
   test_orchestrator.py     Integration tests, real MCP subprocess, offline LLM
 ```
 
-## What would change to point this at real infrastructure
 
-Only `src/infra_simulator.py` is a stand-in. The MCP tool surface in
-`src/mcp_server.py` is written the way you'd write it against real
-backends — swap the simulator calls for a `kubernetes` client,
-`prometheus-api-client`, and a PagerDuty/Opsgenie SDK, and the rest of the
-system (agents, reliability layer, orchestrator, tracing) is unchanged.
-That boundary is deliberate: it's the difference between a toy and
-something you could actually productionize.
-
-## Known simplifications (said out loud, not hidden)
-
-- The offline playbooks are intentionally simple pattern-matching, not real
-  reasoning — they exist so the system is gradeable without an API key.
-  Set `ANTHROPIC_API_KEY` to see the same orchestration driven by an actual
-  model.
-- The infra simulator's fault model is simplified (three scripted fault
-  types) rather than a general-purpose chaos engine.
-- Circuit breaker / loop detector / budget state currently lives in-process
-  for the duration of one CLI run; a persistent version (e.g. Redis-backed)
-  would be the natural next step for a long-running service.
