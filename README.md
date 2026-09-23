@@ -1,153 +1,191 @@
 # DevOps Triage Agent
 
-A multi-agent incident-triage system: a **planner** delegates to **specialist
-agents** (log analysis, metrics analysis, remediation), all of them calling
-tools through a **real MCP server** — not mocked function calls — with an
-explicit **reliability layer** (retry with backoff, circuit breaker, loop
-detection, run budgets) sitting between every agent and every tool call.
+> Reliability-first multi-agent incident triage over a real MCP tool protocol.
 
-It runs two ways:
+A portfolio-grade DevOps incident triage system built around a planner, specialist agents, bounded remediation, and a reliability layer that sits between every agent and every tool call.
 
-- **With `ANTHROPIC_API_KEY` set** — every agent reasons with real Claude
-  (`claude-sonnet-4-6`) over the Anthropic Messages API's native tool use,
-  calling real MCP tools.
-- **Without a key** — a small deterministic "offline playbook" per agent
-  drives the exact same orchestration, reliability stack, and MCP server,
-  so the whole system is runnable and testable with zero setup.
+[![Tests](https://img.shields.io/badge/tests-pytest-informational)](https://github.com/Rollins1989/devops-triage-agent)
+[![Python](https://img.shields.io/badge/python-3.10%2B-blue)](https://www.python.org/)
+[![MCP](https://img.shields.io/badge/protocol-MCP-purple)](https://modelcontextprotocol.io/)
 
-```bash
-pip install -r requirements.txt
-python3 main.py --scenario crashloop            # dry-run (default, safe)
-python3 main.py --scenario crashloop --confirm-actions   # actually remediate
-python3 main.py --scenario latency --flake-rate 0.6       # stress the retry logic
-python3 -m pytest tests/ -v
-```
+## What this demonstrates
 
-Scenarios available: `crashloop` (OOM/CrashLoopBackOff), `latency` (bad
-canary deploy), `db` (connection pool exhaustion — deliberately the one
-case where policy forbids automated remediation, see below).
+This project focuses on the engineering details that are easy to skip in an agent demo:
 
----
-
-## Why this exists
-
-Most "agent demo" projects either (a) call one tool through one hop with no
-failure handling, or (b) fake multi-agent behavior with string-matched
-prompts and no real tool protocol underneath. This project is built to show
-the parts of agentic engineering that actually matter in production:
-
-1. **A real MCP server**, not a mocked tool dispatcher. Any MCP client —
-   Claude Desktop, another framework, this project's own client — can
-   launch `src/mcp_server.py` and call these tools over the real stdio
-   protocol.
-2. **Least-privilege tool access per agent**, enforced in code. The Log
-   Analyst physically cannot call `restart_service`; the allow-list check
-   happens in `BaseAgent.run()`, not just in a system prompt the model
-   could ignore or hallucinate past.
-3. **A dedicated reliability layer** (`src/reliability.py`) that is
-   independently unit-tested with zero LLM/network dependency: exponential
-   backoff with jitter, a per-tool circuit breaker, a loop detector that
-   catches both exact-repeat and oscillating tool-call patterns, and a
-   hard budget on iterations / tool calls / wall-clock time.
-4. **An explicit, conservative escalation policy** — not "the agent decided
-   to give up," but a named, testable rule: DB connection exhaustion always
-   escalates to a human regardless of confidence, because runbook policy
-   says restart/rollback don't fix it and could be disruptive. See
-   `test_db_scenario_escalates_instead_of_auto_remediating`.
-5. **A dry-run safety rail by default.** Remediation actions do not mutate
-   real state unless you pass `--confirm-actions`; every dry run still
-   flows through the full reasoning chain so you can see exactly what the
-   system *would* have done.
-6. **Full structured tracing.** Every agent start/stop, LLM decision, tool
-   call, retry, circuit trip, loop detection, and handoff between agents is
-   written to `traces/<run_id>.jsonl` — the artifact you'd hand an SRE
-   after an incident, or a reviewer, to answer "what did it actually do."
+- **Real MCP server** — tools are exposed through the MCP stdio protocol, not a mocked dispatcher.
+- **Least-privilege agents** — each agent has an explicit tool allow-list enforced in code.
+- **Reliability controls** — retries with exponential backoff and jitter, per-tool circuit breakers, loop detection, and shared run budgets.
+- **Conservative remediation** — at most one bounded remediation attempt before escalation.
+- **Dry-run by default** — destructive/simulated remediation is disabled unless explicitly confirmed.
+- **Structured tracing** — every important decision, handoff, tool call, retry, and guardrail event is written to JSONL.
+- **Offline execution** — the entire system works without an Anthropic API key through deterministic playbooks.
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-    U[Incident report] --> P1[Planner: identify service + priority]
-    P1 --> LA[Log Analyst Agent]
-    P1 --> MA[Metrics Analyst Agent]
-    LA -->|get_recent_logs, search_runbook| MCP[(MCP Server<br/>real stdio protocol)]
-    MA -->|get_service_health, get_metrics| MCP
-    LA --> P2[Planner: synthesize findings]
-    MA --> P2
-    P2 -->|remediate=true| RA[Remediation Agent]
-    P2 -->|remediate=false / db policy| ESC[Escalate: create_incident_ticket]
-    RA -->|restart_service / rollback_deployment /<br/>scale_deployment / create_incident_ticket| MCP
-    MCP --> SIM[(Infra Simulator<br/>SQLite, mutable state)]
+    U[Incident] --> P[Planner]
+    P --> LA[Log Analyst]
+    P --> MA[Metrics Analyst]
+    LA --> MCP[(Real MCP Server)]
+    MA --> MCP
+    MCP --> SIM[(SQLite Infra Simulator)]
+    LA --> S[Planner Synthesis]
+    MA --> S
+    S -->|safe + supported| R[Remediation Agent]
+    S -->|policy / uncertainty| E[Human Escalation]
+    R --> MCP
 
-    subgraph Reliability["Every MCP call passes through"]
-        direction LR
-        R1[Budget check] --> R2[Loop detector] --> R3[Circuit breaker] --> R4[Retry + backoff]
+    subgraph G[Shared reliability layer]
+      B[Budget] --> L[Loop Detector] --> C[Circuit Breaker] --> X[Retry + Backoff]
     end
+
+    MCP --- G
 ```
 
-**Control flow** (`src/orchestrator.py`):
+### Control flow
 
-1. **Plan** — Planner reads the raw incident text, identifies the target
-   service.
-2. **Investigate (concurrent)** — Log Analyst and Metrics Analyst run via
-   `asyncio.gather`, sharing one `ReliableMCPClient` connection, so their
-   tool calls genuinely interleave through the same circuit breaker and
-   loop detector state — this is where a naive implementation would let one
-   agent's retries starve the other.
-3. **Synthesize** — Planner combines both findings and applies policy:
-   escalate if confidence is low, if the two specialists disagree, or if
-   the category is `db` (policy-mandated human review).
-4. **Remediate (conditional)** — Remediation Agent takes exactly one
-   category-appropriate action (`restart_service` for crashloops,
-   `rollback_deployment` for bad deploys), and escalates via
-   `create_incident_ticket` rather than trying a second remediation blind —
-   see the "one attempt, then escalate" rule in
-   `src/agents/remediation_agent.py`.
+1. **Plan** — identify the affected service and incident priority.
+2. **Investigate** — Log Analyst and Metrics Analyst run concurrently against the same MCP client.
+3. **Synthesize** — combine findings and apply explicit escalation policy.
+4. **Remediate** — perform one category-specific action when policy allows it.
+5. **Escalate** — create an incident ticket when confidence is low, signals disagree, reliability guards trip, or policy requires human review.
 
-## The reliability layer, in detail
+## Built-in scenarios
 
-| Concern | Where | Behavior |
-|---|---|---|
-| Transient tool failure | `RetryPolicy` | Up to 3 attempts, exponential backoff + jitter, capped delay. `TerminalError` (e.g. unknown service) skips retry entirely. |
-| Persistently broken tool | `CircuitBreaker` | Per-tool state machine (closed → open → half-open). Opens after N consecutive failures; a half-open trial call either recloses or reopens the circuit. One tool tripping never affects another tool's breaker. |
-| Agent stuck in a loop | `LoopDetector` | Hashes `(tool, args)`; raises on 3+ identical consecutive calls *or* a short oscillating cycle (A, B, A, B, A, B). This is the #1 real-world failure mode of ReAct-style agents and is the thing most demo projects skip entirely. |
-| Runaway resource use | `Budget` | Hard ceiling on iterations, tool calls, and wall-clock time — shared across the whole run, not just per agent, so five well-behaved agents can't collectively blow the budget. |
+| Scenario | Simulated fault | Expected behavior |
+| --- | --- | --- |
+| `crashloop` | OOM / CrashLoopBackOff | Diagnose and optionally restart the service |
+| `latency` | Bad canary deployment | Diagnose and optionally roll back |
+| `db` | Connection-pool exhaustion | Escalate instead of auto-remediating |
 
-All four are exercised by pure unit tests with **no LLM and no
-subprocess** (`tests/test_reliability.py`, 16 tests), and again by
-**integration tests against the real MCP server subprocess**
-(`tests/test_orchestrator.py`, 5 tests) — including a test that cranks
-simulated infra flakiness to 95% and asserts the run still reaches a clean
-terminal state instead of hanging.
+## Quick start
 
-Run the failure modes yourself:
+### 1. Install
+
+Requires Python 3.10+.
 
 ```bash
-# Force retries and watch the circuit breaker trip on restart_service:
-python3 main.py --scenario crashloop --flake-rate 0.9 --confirm-actions
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e ".[dev]"
 ```
 
-## Project layout
+### 2. Run the safe default
 
-```
-src/
-  reliability.py        Retry, circuit breaker, loop detector, budget (no deps on anything else)
-  tracing.py             Structured JSONL tracer + human-readable stderr echo
-  infra_simulator.py      Stateful fake infra (SQLite) backing the MCP tools
-  mcp_server.py            Real MCP server (FastMCP, stdio) exposing 10 DevOps tools
-  mcp_client.py             Reliability-wrapped MCP client used by every agent
-  llm_client.py              AnthropicLLM (real) + OfflineLLM (deterministic fallback)
-  orchestrator.py             Planner-led control flow, concurrent specialist dispatch
-  agents/
-    base_agent.py              Shared tool-calling loop, least-privilege enforcement
-    planner_agent.py            Plan + synthesize
-    log_analyst_agent.py         Logs + runbook search
-    metrics_analyst_agent.py      Health + metrics
-    remediation_agent.py          One bounded remediation attempt, then escalate
-main.py                  CLI entry point
-tests/
-  test_reliability.py     Pure unit tests, no LLM/network
-  test_orchestrator.py     Integration tests, real MCP subprocess, offline LLM
+```bash
+python -m main --scenario crashloop
 ```
 
+This runs the complete planner → specialists → synthesis → remediation flow, but remediation stays in **dry-run mode**.
 
+### 3. Execute a simulated remediation
+
+```bash
+python -m main --scenario crashloop --confirm-actions
+```
+
+### 4. Exercise the reliability layer
+
+```bash
+python -m main --scenario crashloop --flake-rate 0.9 --confirm-actions
+```
+
+### 5. Run the tests
+
+```bash
+python -m pytest
+```
+
+## Optional: use the Anthropic backend
+
+Without `ANTHROPIC_API_KEY`, agents use deterministic offline playbooks so the project remains runnable with no network credentials.
+
+To enable real model-based tool use:
+
+```bash
+export ANTHROPIC_API_KEY="your-key"
+python -m main --scenario crashloop
+```
+
+You can also copy `.env.example` as a reference for supported environment variables.
+
+## Reliability layer
+
+| Component | Purpose |
+| --- | --- |
+| `RetryPolicy` | Retries transient failures with capped exponential backoff + jitter |
+| `CircuitBreaker` | Prevents repeated calls to a persistently failing tool |
+| `LoopDetector` | Detects repeated and oscillating tool-call patterns |
+| `Budget` | Bounds iterations, MCP tool calls, and wall-clock time |
+
+These controls are shared across the run so one agent cannot independently consume the entire reliability budget.
+
+## Safety model
+
+The project intentionally defaults to non-mutating behavior.
+
+- Remediation requires explicit confirmation.
+- Agent tool permissions are enforced in code, not just in prompts.
+- Database-incident handling is policy-gated to human escalation.
+- Reliability failures become structured escalation signals instead of infinite retries.
+
+The infrastructure backend is simulated in SQLite. Connecting the MCP tool layer to production Kubernetes, Prometheus, PagerDuty, or similar systems would require an additional security review and environment-specific authentication/authorization.
+
+## Trace output
+
+Each run creates a file under `traces/`:
+
+```text
+traces/run-XXXXXXXX.jsonl
+```
+
+The trace records agent lifecycle events, LLM decisions, MCP tool calls, retries, circuit transitions, loop detection, handoffs, and escalation decisions.
+
+## Project structure
+
+```text
+.
+├── main.py
+├── pyproject.toml
+├── requirements.txt
+├── .env.example
+├── CONTRIBUTING.md
+├── SECURITY.md
+├── src/
+│   ├── agents/
+│   │   ├── base_agent.py
+│   │   ├── planner_agent.py
+│   │   ├── log_analyst_agent.py
+│   │   ├── metrics_analyst_agent.py
+│   │   ├── remediation_agent.py
+│   │   └── offline_playbooks.py
+│   ├── infra_simulator.py
+│   ├── llm_client.py
+│   ├── mcp_client.py
+│   ├── mcp_server.py
+│   ├── orchestrator.py
+│   ├── reliability.py
+│   └── tracing.py
+└── tests/
+    ├── test_reliability.py
+    └── test_orchestrator.py
+```
+
+## Design notes
+
+The important boundary is the MCP server: the simulator provides deterministic local state, while the tool contract remains MCP-based. That means the orchestration/reliability architecture can be demonstrated locally without pretending that a fake function call is equivalent to a real tool protocol.
+
+The offline backend is deliberately deterministic. It exists to make the system testable and reproducible; it is not presented as a substitute for real model reasoning.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for local setup and pull-request expectations.
+
+## Security
+
+See [SECURITY.md](SECURITY.md). Do not connect this demo to production infrastructure without an appropriate security review.
+
+## License
+
+MIT
