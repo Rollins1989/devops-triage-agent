@@ -1,23 +1,5 @@
 #!/usr/bin/env python3
-"""
-DevOps Triage Agent -- CLI entry point.
-
-Usage:
-    python3 main.py --scenario crashloop
-    python3 main.py --scenario latency
-    python3 main.py --scenario db
-    python3 main.py --scenario crashloop --confirm-actions
-    python3 main.py --scenario crashloop --flake-rate 0.6   # stress the retry/circuit-breaker logic
-
-Environment:
-    ANTHROPIC_API_KEY   if set, agents reason with real Claude (claude-sonnet-4-6)
-                        over real MCP tool calls. If unset, a deterministic
-                        offline playbook drives the same orchestration so the
-                        whole system still runs end-to-end.
-    CONFIRM_ACTIONS     if "true", remediation agent actually mutates infra
-                        state instead of dry-running. Also settable via
-                        --confirm-actions.
-"""
+"""Command-line entry point for the DevOps Triage Agent."""
 
 from __future__ import annotations
 
@@ -39,19 +21,45 @@ SCENARIO_TEXT = {
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Multi-agent DevOps triage system (MCP + reliability engineering demo)")
-    p.add_argument("--scenario", choices=list(SCENARIO_TEXT), default="crashloop")
-    p.add_argument("--flake-rate", type=float, default=0.25, help="Simulated transient failure rate on remediation tool calls")
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--confirm-actions", action="store_true", help="Actually execute remediation actions (default: dry-run)")
-    p.add_argument("--max-tool-calls", type=int, default=20)
-    p.add_argument("--quiet", action="store_true", help="Suppress the live trace echo; still writes traces/<run_id>.jsonl")
-    return p.parse_args()
+    parser = argparse.ArgumentParser(
+        description="Reliability-first multi-agent DevOps triage demo.",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=list(SCENARIO_TEXT),
+        default="crashloop",
+        help="Built-in incident scenario to run.",
+    )
+    parser.add_argument(
+        "--flake-rate",
+        type=float,
+        default=0.25,
+        help="Simulated transient failure rate for remediation tools (0.0-1.0).",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed for deterministic simulation.")
+    parser.add_argument(
+        "--confirm-actions",
+        action="store_true",
+        help="Allow remediation tools to mutate simulator state. Default is dry-run.",
+    )
+    parser.add_argument("--max-tool-calls", type=int, default=20, help="Shared maximum MCP tool calls per run.")
+    parser.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Disable live trace output. JSONL traces are still written.",
+    )
+    return parser.parse_args()
 
 
 async def run(args: argparse.Namespace) -> int:
+    if not 0.0 <= args.flake_rate <= 1.0:
+        raise ValueError("--flake-rate must be between 0.0 and 1.0")
+
     tracer = Tracer(echo=not args.quiet)
-    print(f"\n=== DevOps Triage Agent | run_id={tracer.run_id} | scenario={args.scenario} ===\n", file=sys.stderr)
+    print(
+        f"\n=== DevOps Triage Agent | run_id={tracer.run_id} | scenario={args.scenario} ===\n",
+        file=sys.stderr,
+    )
 
     server_env = {
         "TRIAGE_SCENARIO": args.scenario,
@@ -68,9 +76,18 @@ async def run(args: argparse.Namespace) -> int:
         retry_policy=RetryPolicy(max_attempts=3, base_delay_s=0.4, max_delay_s=4.0),
         circuit_breaker=CircuitBreaker(failure_threshold=3, reset_timeout_s=10.0),
         loop_detector=LoopDetector(max_exact_repeats=2, max_cycle_repeats=3),
-        budget=Budget(max_iterations=30, max_tool_calls=args.max_tool_calls, max_wall_time_s=60.0),
+        budget=Budget(
+            max_iterations=30,
+            max_tool_calls=args.max_tool_calls,
+            max_wall_time_s=60.0,
+        ),
     ) as mcp:
-        report = await triage_incident(SCENARIO_TEXT[args.scenario], mcp, tracer, dry_run=dry_run)
+        report = await triage_incident(
+            SCENARIO_TEXT[args.scenario],
+            mcp,
+            tracer,
+            dry_run=dry_run,
+        )
 
         print("\n" + "=" * 70, file=sys.stderr)
         print("FINAL TRIAGE REPORT", file=sys.stderr)
@@ -79,12 +96,20 @@ async def run(args: argparse.Namespace) -> int:
         print(f"\nCircuit breaker status: {mcp.circuit_breaker.status()}", file=sys.stderr)
         print(f"Budget usage: {mcp.budget.snapshot()}", file=sys.stderr)
         print(f"Full trace written to: {tracer.path}", file=sys.stderr)
+
         if dry_run:
-            print("\n(DRY_RUN mode: no remediation actions were actually executed. Pass --confirm-actions to allow them.)", file=sys.stderr)
+            print(
+                "\n(DRY_RUN mode: no remediation actions were executed. "
+                "Pass --confirm-actions to allow them.)",
+                file=sys.stderr,
+            )
 
     return 1 if report.escalated else 0
 
 
+def main() -> int:
+    return asyncio.run(run(parse_args()))
+
+
 if __name__ == "__main__":
-    exit_code = asyncio.run(run(parse_args()))
-    sys.exit(exit_code)
+    raise SystemExit(main())
