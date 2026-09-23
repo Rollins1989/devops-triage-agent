@@ -97,6 +97,15 @@ python -m main --scenario crashloop --flake-rate 0.9 --confirm-actions
 python -m pytest
 ```
 
+For repeatable developer workflows, a small Makefile is also provided:
+
+```bash
+make install
+make test
+make demo
+make stress
+```
+
 ## Optional: use the Anthropic backend
 
 Without `ANTHROPIC_API_KEY`, agents use deterministic offline playbooks so the project remains runnable with no network credentials.
@@ -118,6 +127,7 @@ You can also copy `.env.example` as a reference for supported environment variab
 | `CircuitBreaker` | Prevents repeated calls to a persistently failing tool |
 | `LoopDetector` | Detects repeated and oscillating tool-call patterns |
 | `Budget` | Bounds iterations, MCP tool calls, and wall-clock time |
+| MCP timeout | Bounds an individual tool call so a hung integration cannot stall the run |
 
 These controls are shared across the run so one agent cannot independently consume the entire reliability budget.
 
@@ -131,6 +141,16 @@ The project intentionally defaults to non-mutating behavior.
 - Reliability failures become structured escalation signals instead of infinite retries.
 
 The infrastructure backend is simulated in SQLite. Connecting the MCP tool layer to production Kubernetes, Prometheus, PagerDuty, or similar systems would require an additional security review and environment-specific authentication/authorization.
+
+## Machine-readable output
+
+For CI pipelines, dashboards, or another automation layer, emit a structured JSON report:
+
+```bash
+python -m main --scenario crashloop --json-report > report.json
+```
+
+The report contains the incident, affected service, specialist findings, planner decision, remediation result, escalation state, and per-agent execution metadata.
 
 ## Trace output
 
