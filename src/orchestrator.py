@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Optional
 
 from src.agents import AgentResult, LogAnalystAgent, MetricsAnalystAgent, PlannerAgent, RemediationAgent
@@ -45,6 +45,12 @@ class TriageReport:
     escalated: bool = False
     escalation_reasons: list[str] = field(default_factory=list)
     agent_results: list[AgentResult] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        """Return a JSON-serializable report for automation and CI consumers."""
+        data = asdict(self)
+        data["agent_results"] = [asdict(result) for result in self.agent_results]
+        return data
 
     def summary(self) -> str:
         lines = [
