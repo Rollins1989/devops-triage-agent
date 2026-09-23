@@ -203,3 +203,17 @@ def test_budget_snapshot_reports_usage():
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_retry_success_does_not_require_manual_circuit_reset():
+    """A transient failure that succeeds on retry is not a circuit failure."""
+    cb = CircuitBreaker(failure_threshold=2, reset_timeout_s=10.0)
+    cb.on_success("tool")
+    cb.on_success("tool")
+    assert cb.status()["tool"] == CircuitState.CLOSED.value
+
+
+def test_budget_wall_clock_is_checked_for_tool_calls():
+    b = Budget(max_iterations=10, max_tool_calls=10, max_wall_time_s=0)
+    with pytest.raises(BudgetExceededError):
+        b.check_tool_call()
