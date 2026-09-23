@@ -48,6 +48,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Disable live trace output. JSONL traces are still written.",
     )
+    parser.add_argument(
+        "--json-report",
+        action="store_true",
+        help="Emit the final triage report as machine-readable JSON on stdout.",
+    )
     return parser.parse_args()
 
 
@@ -92,7 +97,11 @@ async def run(args: argparse.Namespace) -> int:
         print("\n" + "=" * 70, file=sys.stderr)
         print("FINAL TRIAGE REPORT", file=sys.stderr)
         print("=" * 70, file=sys.stderr)
-        print(report.summary(), file=sys.stderr)
+        if args.json_report:
+            import json
+            print(json.dumps(report.to_dict(), indent=2, default=str))
+        else:
+            print(report.summary(), file=sys.stderr)
         print(f"\nCircuit breaker status: {mcp.circuit_breaker.status()}", file=sys.stderr)
         print(f"Budget usage: {mcp.budget.snapshot()}", file=sys.stderr)
         print(f"Full trace written to: {tracer.path}", file=sys.stderr)
